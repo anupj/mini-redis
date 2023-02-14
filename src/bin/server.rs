@@ -1,94 +1,94 @@
-use bytes::Bytes;
-use mini_redis::{Connection, Frame};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tokio::net::{TcpListener, TcpStream};
+//! mini-redis server.
+//!
+//! This file is the entry point for the server implemented in the library. It
+//! performs command line parsing and passes the arguments on to
+//! `mini_redis::server`.
+//!
+//! The `clap` crate is used for parsing arguments.
 
-type Db = Arc<Mutex<HashMap<String, Bytes>>>;
-type ShardedDb = Arc<Vec<Mutex<HashMap<String, Vec<u8>>>>>;
+use mini_redis::{server, DEFAULT_PORT};
 
-struct CanIncrement {
-    mutex: Mutex<i32>,
-}
+use clap::Parser;
+use tokio::net::TcpListener;
+use tokio::signal;
 
-impl CanIncrement {
-    // This is fn is not marked async
-    fn increment(&self) {
-        let mut lock = self.mutex.lock().unwrap();
-        *lock += 1;
-    }
-}
-
-async fn increment_and_do_stuff(can_incr: &CanIncrement) {
-    can_incr.increment();
-}
-
-fn new_sharded_db(num_shards: usize) -> ShardedDb {
-    let mut db = Vec::with_capacity(num_shards);
-    for _ in 0..num_shards {
-        db.push(Mutex::new(HashMap::new()));
-    }
-    Arc::new(db)
-}
+#[cfg(feature = "otel")]
+// To be able to set the XrayPropagator
+use opentelemetry::global;
+#[cfg(feature = "otel")]
+// To configure certain options such as sampling rate
+use opentelemetry::sdk::trace as sdktrace;
+#[cfg(feature = "otel")]
+// For passing along the same XrayId across services
+use opentelemetry_aws::trace::XrayPropagator;
+#[cfg(feature = "otel")]
+// The `Ext` traits are to allow the Registry to accept the
+// OpenTelemetry-specific types (such as `OpenTelemetryLayer`)
+use tracing_subscriber::{
+    fmt, layer::SubscriberExt, util::SubscriberInitExt, util::TryInitError, EnvFilter,
+};
 
 #[tokio::main]
-async fn main() {
-    // Bind the listener to the address
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+pub async fn main() -> mini_redis::Result<()> {
+    set_up_logging()?;
 
-    println!("Listening");
+    let cli = Cli::parse();
+    let port = cli.port.unwrap_or(DEFAULT_PORT);
 
-    let db = Arc::new(Mutex::new(HashMap::new()));
+    // Bind a TCP listener
+    let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
 
-    loop {
-        // The second item contains the IP and
-        // port of the new connection
-        let (socket, _) = listener.accept().await.unwrap();
+    server::run(listener, signal::ctrl_c()).await;
 
-        // Cone the handle to the hash map
-        let db = db.clone();
-
-        // A new task is spawned for each inbound socket.
-        // The socket is moved to the new task and processed there.
-        tokio::spawn(async move {
-            process(socket, db).await;
-        });
-    }
+    Ok(())
 }
 
-async fn process(socket: TcpStream, db: Db) {
-    use mini_redis::Command::{self, Get, Set};
+#[derive(Parser, Debug)]
+#[clap(name = "mini-redis-server", version, author, about = "A Redis server")]
+struct Cli {
+    #[clap(long)]
+    port: Option<u16>,
+}
 
-    // The `Connection` lets us read/write redis **frames**
-    // instead of byte streams.
-    let mut connection = Connection::new(socket);
+#[cfg(not(feature = "otel"))]
+fn set_up_logging() -> mini_redis::Result<()> {
+    // See https://docs.rs/tracing for more info
+    tracing_subscriber::fmt::try_init()
+}
 
-    // use `read_frame` to receive a command from
-    // the connection.
-    while let Some(frame) = connection.read_frame().await.unwrap() {
-        let response = match Command::from_frame(frame).unwrap() {
-            Set(cmd) => {
-                // The value is stored as `Vec<u8>`
-                let mut db = db.lock().unwrap();
-                db.insert(cmd.key().to_string(), cmd.value().to_vec().into());
-                Frame::Simple("OK".to_string())
-            }
-            Get(cmd) => {
-                let db = db.lock().unwrap();
-                if let Some(value) = db.get(cmd.key()) {
-                    // `Frame::Bulk` expects dta to be of type `Bytes`.
-                    // This type will be covered later in the tutorial.
-                    // Form now, `&Vec<u8>` is converted to `Bytes` using
-                    // `into()`
-                    Frame::Bulk(value.clone().into())
-                } else {
-                    Frame::Null
-                }
-            }
-            cmd => panic!("unimplemented {:?}", cmd),
-        };
+#[cfg(feature = "otel")]
+fn set_up_logging() -> Result<(), TryInitError> {
+    // Set the global propagator to X-Ray propagator
+    // Note: If you need to pass the x-amzn-trace-id across services in the same trace,
+    // you will need this line. However, this requires additional code not pictured here.
+    // For a full example using hyper, see:
+    // https://github.com/open-telemetry/opentelemetry-rust/blob/main/examples/aws-xray/src/server.rs#L14-L26
+    global::set_text_map_propagator(XrayPropagator::default());
 
-        // Write the response to the client
-        connection.write_frame(&response).await.unwrap();
-    }
+    let tracer = opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(opentelemetry_otlp::new_exporter().tonic())
+        .with_trace_config(
+            sdktrace::config()
+                .with_sampler(sdktrace::Sampler::AlwaysOn)
+                // Needed in order to convert the trace IDs into an Xray-compatible format
+                .with_id_generator(sdktrace::XrayIdGenerator::default()),
+        )
+        .install_simple()
+        .expect("Unable to initialize OtlpPipeline");
+
+    // Create a tracing layer with the configured tracer
+    let opentelemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    // Parse an `EnvFilter` configuration from the `RUST_LOG`
+    // environment variable.
+    let filter = EnvFilter::from_default_env();
+
+    // Use the tracing subscriber `Registry`, or any other subscriber
+    // that impls `LookupSpan`
+    tracing_subscriber::registry()
+        .with(opentelemetry)
+        .with(filter)
+        .with(fmt::Layer::default())
+        .try_init()
 }
